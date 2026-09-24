@@ -25,7 +25,6 @@ def find_relational_columns(tables):
             for field, value in record['fields'].items():
                 if isinstance(value, list) and len(value) > 0 and isinstance(value[0], str) and value[0].startswith('rec'):
                     relational_columns.setdefault(table_name, set()).add(field)
-                    break  # Break the loop if a relational column is found for the table
     return relational_columns
 
 # Build knowledge graph
