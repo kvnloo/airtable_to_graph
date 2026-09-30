@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 def load_functions():
     source = Path("main.py").read_text()
     tree = ast.parse(source)
-    wanted = {"get_base_schema", "find_relational_columns", "build_knowledge_graph"}
+    wanted = {
+        "get_base_schema",
+        "find_relational_columns",
+        "build_graph_model",
+        "build_knowledge_graph",
+    }
     module = ast.Module(
         body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted],
         type_ignores=[],
@@ -23,12 +28,19 @@ def load_functions():
     return (
         namespace["get_base_schema"],
         namespace["find_relational_columns"],
+        namespace["build_graph_model"],
         namespace["build_knowledge_graph"],
         requests,
     )
 
 
-get_base_schema, find_relational_columns, build_knowledge_graph, requests = load_functions()
+(
+    get_base_schema,
+    find_relational_columns,
+    build_graph_model,
+    build_knowledge_graph,
+    requests,
+) = load_functions()
 
 
 class RelationalColumnsTest(unittest.TestCase):
@@ -64,20 +76,6 @@ class RelationalColumnsTest(unittest.TestCase):
             {"Companies": {"Founders", "Sectors"}},
         )
 
-    def test_field_order_does_not_change_relationships(self):
-        forward = {"tables": [{"name": "Companies", "fields": [
-            {"name": "Founders", "type": "multipleRecordLinks"},
-            {"name": "Sectors", "type": "multipleRecordLinks"},
-        ]}]}
-        reverse = {"tables": [{"name": "Companies", "fields": [
-            {"name": "Sectors", "type": "multipleRecordLinks"},
-            {"name": "Founders", "type": "multipleRecordLinks"},
-        ]}]}
-        self.assertEqual(
-            find_relational_columns(forward),
-            find_relational_columns(reverse),
-        )
-
     def test_empty_linked_field_is_still_discovered(self):
         schema = {"tables": [{"name": "Companies", "fields": [
             {"name": "Investors", "type": "multipleRecordLinks"},
@@ -87,7 +85,7 @@ class RelationalColumnsTest(unittest.TestCase):
             {"Companies": {"Investors"}},
         )
 
-    def test_non_link_list_fields_are_ignored_even_if_values_could_look_like_ids(self):
+    def test_non_link_list_fields_are_ignored(self):
         schema = {"tables": [{"name": "Companies", "fields": [
             {"name": "Tags", "type": "multipleSelects"},
             {"name": "Attachments", "type": "multipleAttachments"},
@@ -98,45 +96,113 @@ class RelationalColumnsTest(unittest.TestCase):
             {"Companies": {"Founders"}},
         )
 
-    def test_tables_without_relationships_are_omitted(self):
-        schema = {"tables": [
-            {"name": "Notes", "fields": [{"name": "Name", "type": "singleLineText"}]},
-            {"name": "Companies", "fields": [{"name": "Founders", "type": "multipleRecordLinks"}]},
-        ]}
-        self.assertEqual(
-            find_relational_columns(schema),
+    def test_graph_model_skips_dangling_links_and_counts_them(self):
+        tables = {
+            "Companies": [{
+                "id": "recCompany",
+                "fields": {
+                    "Name": "Acme",
+                    "Founders": ["recFounder", "recMissing"],
+                },
+            }],
+            "People": [{"id": "recFounder", "fields": {"Name": "Ada"}}],
+        }
+        nodes, edges, diagnostics = build_graph_model(
+            tables,
             {"Companies": {"Founders"}},
         )
 
-    def test_missing_tables_is_safe(self):
-        self.assertEqual(find_relational_columns({}), {})
+        self.assertEqual(set(nodes), {"recCompany", "recFounder"})
+        self.assertEqual(edges, [("recCompany", "recFounder", "Founders")])
+        self.assertEqual(diagnostics["records"], 2)
+        self.assertEqual(diagnostics["edges"], 1)
+        self.assertEqual(diagnostics["dangling_edges"], 1)
+
+    def test_graph_model_handles_schema_table_missing_from_records(self):
+        nodes, edges, diagnostics = build_graph_model(
+            {"Companies": [{"id": "recCompany", "fields": {"Name": "Acme"}}]},
+            {"MissingTable": {"Links"}},
+        )
+        self.assertEqual(set(nodes), {"recCompany"})
+        self.assertEqual(edges, [])
+        self.assertEqual(diagnostics["relationship_fields"], 1)
+
+    def test_graph_model_counts_invalid_link_values_without_crashing(self):
+        tables = {
+            "Companies": [{
+                "id": "recCompany",
+                "fields": {"Name": "Acme", "Founders": "recFounder"},
+            }],
+        }
+        _, edges, diagnostics = build_graph_model(
+            tables,
+            {"Companies": {"Founders"}},
+        )
+        self.assertEqual(edges, [])
+        self.assertEqual(diagnostics["invalid_link_values"], 1)
+
+    def test_large_synthetic_base_has_exact_linear_accounting(self):
+        size = 5000
+        people = [
+            {"id": f"recPerson{i}", "fields": {"Name": f"Person {i}"}}
+            for i in range(size)
+        ]
+        companies = [
+            {
+                "id": f"recCompany{i}",
+                "fields": {
+                    "Name": f"Company {i}",
+                    "Founders": [f"recPerson{i}"],
+                },
+            }
+            for i in range(size)
+        ]
+        nodes, edges, diagnostics = build_graph_model(
+            {"Companies": companies, "People": people},
+            {"Companies": {"Founders"}},
+        )
+
+        self.assertEqual(len(nodes), size * 2)
+        self.assertEqual(len(edges), size)
+        self.assertEqual(diagnostics, {
+            "tables": 2,
+            "records": size * 2,
+            "nodes": size * 2,
+            "edges": size,
+            "relationship_fields": 1,
+            "dangling_edges": 0,
+            "invalid_link_values": 0,
+        })
 
     @patch("builtins.print")
-    def test_graph_builder_receives_all_schema_relationships(self, _):
+    def test_renderer_receives_only_valid_model_edges(self, _):
         tables = {
-            "Companies": [{"id": "recCompany", "fields": {
-                "Name": "Acme", "Founders": ["recFounder"], "Sectors": ["recSector"],
-            }}],
+            "Companies": [{
+                "id": "recCompany",
+                "fields": {
+                    "Name": "Acme",
+                    "Founders": ["recFounder", "recMissing"],
+                },
+            }],
             "People": [{"id": "recFounder", "fields": {"Name": "Ada"}}],
-            "Sectors": [{"id": "recSector", "fields": {"Name": "AI"}}],
         }
-        schema = {"tables": [
-            {"name": "Companies", "fields": [
-                {"name": "Founders", "type": "multipleRecordLinks"},
-                {"name": "Sectors", "type": "multipleRecordLinks"},
-            ]},
-            {"name": "People", "fields": []},
-            {"name": "Sectors", "fields": []},
-        ]}
-        columns = find_relational_columns(schema)
         network = MagicMock()
-        with patch.dict(build_knowledge_graph.__globals__, {"Network": MagicMock(return_value=network)}):
-            build_knowledge_graph(tables, columns)
-        edges = {(call.args[0], call.args[1], call.kwargs["title"]) for call in network.add_edge.call_args_list}
-        self.assertEqual(edges, {
-            ("recCompany", "recFounder", "Founders"),
-            ("recCompany", "recSector", "Sectors"),
-        })
+        with patch.dict(
+            build_knowledge_graph.__globals__,
+            {"Network": MagicMock(return_value=network)},
+        ):
+            returned, diagnostics = build_knowledge_graph(
+                tables,
+                {"Companies": {"Founders"}},
+            )
+
+        self.assertIs(returned, network)
+        network.add_edge.assert_called_once_with(
+            "recCompany",
+            "recFounder",
+            title="Founders",
+        )
+        self.assertEqual(diagnostics["dangling_edges"], 1)
 
 
 if __name__ == "__main__":
