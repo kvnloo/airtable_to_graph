@@ -16,15 +16,19 @@ def get_airtable_data(table_name):
     table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, table_name)
     return table.all()
 
-# Identify relational columns
-def find_relational_columns(tables):
+# Identify relational columns from Airtable's schema instead of guessing
+# from record values. Linked-record fields are typed as multipleRecordLinks.
+def find_relational_columns(base_schema):
     print("finding relational columns")
     relational_columns = {}
-    for table_name, records in tables.items():
-        for record in records:
-            for field, value in record['fields'].items():
-                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], str) and value[0].startswith('rec'):
-                    relational_columns.setdefault(table_name, set()).add(field)
+    for table in base_schema.get('tables', []):
+        columns = {
+            field['name']
+            for field in table.get('fields', [])
+            if field.get('type') == 'multipleRecordLinks'
+        }
+        if columns:
+            relational_columns[table['name']] = columns
     return relational_columns
 
 # Build knowledge graph
@@ -53,7 +57,8 @@ def build_knowledge_graph(tables, relational_columns):
 
 @app.route('/')
 def index():
-    # Get all table names from the base schema
+    # Get the base schema once. It supplies both table names and the
+    # authoritative linked-record field types.
     url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
     headers = {'Authorization': f'Bearer {AIRTABLE_API_KEY}'}
     response = requests.get(url, headers=headers)
@@ -65,8 +70,8 @@ def index():
     with ThreadPoolExecutor() as executor:
         tables = {table_name: data for table_name, data in zip(table_names, executor.map(get_airtable_data, table_names))}
 
-    # Identify relational columns
-    relational_columns = find_relational_columns(tables)
+    # Identify relational columns from schema metadata.
+    relational_columns = find_relational_columns(base_schema)
 
     # Build knowledge graph
     net = build_knowledge_graph(tables, relational_columns)
