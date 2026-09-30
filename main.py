@@ -16,6 +16,13 @@ def get_airtable_data(table_name):
     table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, table_name)
     return table.all()
 
+def get_base_schema():
+    url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
+    headers = {'Authorization': f'Bearer {AIRTABLE_API_KEY}'}
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
 # Identify relational columns from Airtable's schema instead of guessing
 # from record values. Linked-record fields are typed as multipleRecordLinks.
 def find_relational_columns(base_schema):
@@ -59,11 +66,7 @@ def build_knowledge_graph(tables, relational_columns):
 def index():
     # Get the base schema once. It supplies both table names and the
     # authoritative linked-record field types.
-    url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
-    headers = {'Authorization': f'Bearer {AIRTABLE_API_KEY}'}
-    response = requests.get(url, headers=headers)
-    base_schema = response.json()
-    print(base_schema)
+    base_schema = get_base_schema()
     table_names = [table['name'] for table in base_schema['tables']]
 
     # Retrieve data from Airtable using parallel processing
