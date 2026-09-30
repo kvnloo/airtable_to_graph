@@ -7,20 +7,49 @@ from unittest.mock import MagicMock, patch
 def load_functions():
     source = Path("main.py").read_text()
     tree = ast.parse(source)
-    wanted = {"find_relational_columns", "build_knowledge_graph"}
+    wanted = {"get_base_schema", "find_relational_columns", "build_knowledge_graph"}
     module = ast.Module(
         body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted],
         type_ignores=[],
     )
-    namespace = {"Network": MagicMock}
+    requests = MagicMock()
+    namespace = {
+        "Network": MagicMock,
+        "requests": requests,
+        "AIRTABLE_API_KEY": "test-token",
+        "AIRTABLE_BASE_ID": "appTest",
+    }
     exec(compile(module, "main.py", "exec"), namespace)
-    return namespace["find_relational_columns"], namespace["build_knowledge_graph"]
+    return (
+        namespace["get_base_schema"],
+        namespace["find_relational_columns"],
+        namespace["build_knowledge_graph"],
+        requests,
+    )
 
 
-find_relational_columns, build_knowledge_graph = load_functions()
+get_base_schema, find_relational_columns, build_knowledge_graph, requests = load_functions()
 
 
 class RelationalColumnsTest(unittest.TestCase):
+    def setUp(self):
+        requests.reset_mock()
+
+    def test_schema_fetch_has_timeout_and_raises_for_http_errors(self):
+        response = MagicMock()
+        response.json.return_value = {"tables": [{"name": "Companies", "fields": []}]}
+        requests.get.return_value = response
+
+        schema = get_base_schema()
+
+        requests.get.assert_called_once_with(
+            "https://api.airtable.com/v0/meta/bases/appTest/tables",
+            headers={"Authorization": "Bearer test-token"},
+            timeout=30,
+        )
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(schema["tables"][0]["name"], "Companies")
+
     def test_finds_every_linked_record_field_from_schema(self):
         schema = {"tables": [{
             "name": "Companies",
