@@ -34,16 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 with patch.dict(os.environ, {"AIRTABLE_API_KEY": FAKE_TOKEN}):
     import main
 
-# requirements.txt pins Flask 2.3.2 but not Werkzeug, so a fresh install gets
-# Werkzeug >= 3.1, which dropped ``werkzeug.__version__``. Flask 2.3.2's test
-# client reads it to build a User-Agent; restore it for the tests only.
-import werkzeug  # noqa: E402
-
-if not hasattr(werkzeug, "__version__"):
-    from importlib.metadata import version
-
-    werkzeug.__version__ = version("werkzeug")
-
 SCHEMA_URL = f"https://api.airtable.com/v0/meta/bases/{FAKE_BASE}/tables"
 HANG_LIMIT = 5.0  # seconds before a request is declared hung
 SHORT_TIMEOUT = 0.5  # timeout injected for the stalled-fetch test
@@ -235,7 +225,7 @@ class RouteTest(unittest.TestCase):
         self.assertLess(len(text), 200, text)
         for fragment in fragments:
             self.assertIn(fragment, text)
-        for leaked in (FAKE_TOKEN, "Bearer", "Authorization", BODY_MARKER, "Traceback"):
+        for leaked in (FAKE_TOKEN, "Bearer", "Authorization", BODY_MARKER, "Traceback", "https://", FAKE_BASE):
             self.assertNotIn(leaked, text)
 
     def graph_edges(self):
@@ -333,7 +323,7 @@ class RouteTest(unittest.TestCase):
 
                 response = self.client.get("/")
 
-                self.assert_error_page(response, 502, "Airtable", f"HTTP {status}")
+                self.assert_error_page(response, 502, f"Airtable returned HTTP {status}")
                 # Nothing else is fetched once the schema request has failed.
                 self.assertEqual([call["url"] for call in self.stub.calls], [SCHEMA_URL])
 
@@ -346,7 +336,7 @@ class RouteTest(unittest.TestCase):
 
         response = self.client.get("/")
 
-        self.assert_error_page(response, 502, "Airtable", "HTTP 403")
+        self.assert_error_page(response, 502, "Airtable returned HTTP 403")
 
     # -- transport failures -----------------------------------------------
 
