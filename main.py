@@ -10,18 +10,30 @@ app = Flask(__name__)
 # Airtable configuration
 AIRTABLE_API_KEY = os.environ['AIRTABLE_API_KEY']
 AIRTABLE_BASE_ID = '' # put your airtable base here
+AIRTABLE_TIMEOUT = 30 # seconds, applied to every Airtable request
+
+class AirtableSchemaError(RuntimeError):
+    """The schema response was not the expected {"tables": [...]} payload."""
 
 # Retrieve data from Airtable
 def get_airtable_data(table_name):
-    table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, table_name)
+    table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, table_name, timeout=AIRTABLE_TIMEOUT)
     return table.all()
 
 def get_base_schema():
     url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
     headers = {'Authorization': f'Bearer {AIRTABLE_API_KEY}'}
-    response = requests.get(url, headers=headers, timeout=30)
+    response = requests.get(url, headers=headers, timeout=AIRTABLE_TIMEOUT)
     response.raise_for_status()
-    return response.json()
+    try:
+        base_schema = response.json()
+    except ValueError as exc:
+        raise AirtableSchemaError(
+            f"Airtable schema response (HTTP {response.status_code}) is not valid JSON"
+        ) from exc
+    if not isinstance(base_schema, dict) or not isinstance(base_schema.get('tables'), list):
+        raise AirtableSchemaError('Airtable schema response has no "tables" list')
+    return base_schema
 
 # Identify relational columns from Airtable's schema instead of guessing
 # from record values. Linked-record fields are typed as multipleRecordLinks.

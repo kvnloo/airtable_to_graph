@@ -14,7 +14,13 @@ def load_functions():
         "build_knowledge_graph",
     }
     module = ast.Module(
-        body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted],
+        body=[
+            node
+            for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+            # the timeout constant get_base_schema() reads, taken from main.py itself
+            or (isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "AIRTABLE_TIMEOUT")
+        ],
         type_ignores=[],
     )
     requests = MagicMock()
