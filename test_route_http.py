@@ -11,6 +11,7 @@ non-loopback address. No real token is used and Airtable is never contacted.
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -68,6 +69,9 @@ COMPANIES = [
 ]
 PEOPLE_PAGE_1 = [{"id": "recPerson1", "fields": {"Name": "Ada"}}]
 PEOPLE_PAGE_2 = [{"id": "recPerson2", "fields": {"Name": "Grace"}}]
+
+# Planted in stubbed upstream bodies; must never reach the browser.
+BODY_MARKER = "UPSTREAM-BODY-MARKER-7f3a"
 
 
 class NonLoopbackConnection(AssertionError):
@@ -130,8 +134,9 @@ class StubAdapter(BaseAdapter):
     """Transport adapter that answers from a route table instead of the network.
 
     A route is ``(status, body)`` for a canned reply, a list of those for
-    successive calls (pagination), or ``("forward", port)`` to send the request
-    for real to a loopback port so genuine socket timeouts are exercised.
+    successive calls (pagination), ``("forward", port)`` to send the request
+    for real to a loopback port so genuine socket errors are exercised, or
+    ``("raise", exception)`` to fail the way a transport would.
     """
 
     def __init__(self):
@@ -165,6 +170,9 @@ class StubAdapter(BaseAdapter):
             forwarded = request.copy()
             forwarded.url = f"http://127.0.0.1:{reply[1]}{parts.path}"
             return HTTPAdapter().send(forwarded, stream=stream, timeout=timeout, verify=False, proxies={})
+
+        if reply[0] == "raise":
+            raise reply[1]
 
         status, body = reply
         response = requests.Response()
@@ -205,31 +213,36 @@ class RouteTest(unittest.TestCase):
             self.addCleanup(p.stop)
 
         # index() writes static/graph.html relative to the working directory.
+        # Like a fresh checkout, the directory starts without static/.
         workdir = tempfile.TemporaryDirectory()
         self.addCleanup(workdir.cleanup)
         self.workdir = Path(workdir.name)
-        (self.workdir / "static").mkdir()
         previous = os.getcwd()
         os.chdir(self.workdir)
         self.addCleanup(os.chdir, previous)
 
-        main.app.config["TESTING"] = True  # let exceptions reach the test
+        main.app.config["TESTING"] = True  # let unhandled exceptions reach the test
         self.client = main.app.test_client()
 
     def tearDown(self):
         self.assertEqual(self.guard.violations, [], "a non-loopback connection was attempted")
 
-    def get_expecting_error(self):
-        """GET / and return the exception the route raised."""
-        with self.assertRaises(Exception) as caught:
-            self.client.get("/")
-        return caught.exception
-
-    def assert_schema_error(self, exc, *fragments):
-        self.assertEqual(type(exc).__name__, "AirtableSchemaError", f"got {exc!r}")
-        self.assertIsInstance(exc, main.AirtableSchemaError)
+    def assert_error_page(self, response, status, *fragments):
+        """A short plain-text error with no credentials or upstream body."""
+        text = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, status, text)
+        self.assertEqual(response.mimetype, "text/plain")
+        self.assertLess(len(text), 200, text)
         for fragment in fragments:
-            self.assertIn(fragment, str(exc))
+            self.assertIn(fragment, text)
+        for leaked in (FAKE_TOKEN, "Bearer", "Authorization", BODY_MARKER, "Traceback"):
+            self.assertNotIn(leaked, text)
+
+    def graph_edges(self):
+        html = (self.workdir / "static" / "graph.html").read_text()
+        match = re.search(r"edges = new vis\.DataSet\((\[.*?\])\);", html, re.S)
+        self.assertIsNotNone(match, "no edge data set in static/graph.html")
+        return sorted((edge["from"], edge["to"], edge["title"]) for edge in json.loads(match.group(1)))
 
     def add_happy_records(self):
         self.stub.add(records_url("Companies"), (200, {"records": COMPANIES}))
@@ -255,15 +268,22 @@ class RouteTest(unittest.TestCase):
         self.stub.add(SCHEMA_URL, (200, SCHEMA))
         self.add_happy_records()
 
-        response = self.client.get("/")
+        with patch.object(main, "build_knowledge_graph", wraps=main.build_knowledge_graph) as build:
+            response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"static/graph.html", response.data)
         graph = (self.workdir / "static" / "graph.html").read_text()
         for node_id in ("recCompany1", "recPerson1", "recPerson2"):
             self.assertIn(node_id, graph)
-        self.assertIn("Employees", graph)  # edge title from the linked-record field
-        self.assertNotIn("b2b", graph)  # a multi-select value is not a node
+        self.assertEqual(
+            self.graph_edges(),
+            [("recCompany1", "recPerson1", "Employees"), ("recCompany1", "recPerson2", "Employees")],
+        )
+        # Only the linked-record field is a relation; the multi-select "Tags"
+        # field is not, so its values are never looked up as record ids.
+        build.assert_called_once()
+        self.assertEqual(build.call_args.args[1], {"Companies": {"Employees"}})
 
         self.assertEqual(len(self.stub.calls_to(SCHEMA_URL)), 1)
         self.assertEqual(len(self.stub.calls_to(records_url("Companies"))), 1)
@@ -275,39 +295,103 @@ class RouteTest(unittest.TestCase):
             self.assertEqual(call["authorization"], f"Bearer {FAKE_TOKEN}")
             self.assertEqual(call["timeout"], 30, f"no 30 s timeout on {call['url']}")
 
-    # -- schema HTTP errors -----------------------------------------------
+    # -- fresh checkout ---------------------------------------------------
 
-    def test_schema_http_errors_name_the_status(self):
+    def test_static_directory_is_created_when_missing(self):
+        self.assertFalse((self.workdir / "static").exists())
+        self.stub.add(SCHEMA_URL, (200, SCHEMA))
+        self.add_happy_records()
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue((self.workdir / "static" / "graph.html").is_file())
+
+    def test_existing_static_directory_is_reused(self):
+        (self.workdir / "static").mkdir()
+        (self.workdir / "static" / "keep.txt").write_text("keep")
+        self.stub.add(SCHEMA_URL, (200, SCHEMA))
+        self.add_happy_records()
+
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue((self.workdir / "static" / "graph.html").is_file())
+        self.assertEqual((self.workdir / "static" / "keep.txt").read_text(), "keep")
+
+    # -- upstream HTTP errors ---------------------------------------------
+
+    def test_schema_http_errors_become_502_naming_the_status(self):
         cases = {
-            401: b'{"error": {"type": "AUTHENTICATION_REQUIRED"}}',
-            500: b"<html><body>Internal Server Error</body></html>",
+            401: json.dumps({"error": {"type": "AUTHENTICATION_REQUIRED", "message": BODY_MARKER}}).encode(),
+            500: f"<html><body>Internal Server Error {BODY_MARKER}</body></html>".encode(),
         }
         for status, body in cases.items():
             with self.subTest(status=status):
                 self.stub.calls.clear()
                 self.stub.add(SCHEMA_URL, (status, body))
 
-                exc = self.get_expecting_error()
+                response = self.client.get("/")
 
-                self.assertIsInstance(exc, requests.exceptions.HTTPError, f"got {exc!r}")
-                self.assertEqual(exc.response.status_code, status)
-                self.assertIn(str(status), str(exc))
+                self.assert_error_page(response, 502, "Airtable", f"HTTP {status}")
                 # Nothing else is fetched once the schema request has failed.
                 self.assertEqual([call["url"] for call in self.stub.calls], [SCHEMA_URL])
 
+    def test_records_http_error_becomes_502_without_the_upstream_body(self):
+        # pyairtable appends the upstream "error" payload to the exception
+        # text, so the page must not be built from str(exception).
+        self.stub.add(SCHEMA_URL, (200, SCHEMA))
+        self.stub.add(records_url("Companies"), (403, {"error": {"type": "FORBIDDEN", "message": BODY_MARKER}}))
+        self.stub.add(records_url("People"), (200, {"records": PEOPLE_PAGE_1}))
+
+        response = self.client.get("/")
+
+        self.assert_error_page(response, 502, "Airtable", "HTTP 403")
+
+    # -- transport failures -----------------------------------------------
+
+    def test_refused_connection_becomes_502(self):
+        # A loopback port with nothing listening: a genuine ConnectionError.
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        self.stub.add(SCHEMA_URL, ("forward", port))
+
+        response = self.client.get("/")
+
+        self.assert_error_page(response, 502, "Airtable")
+        self.assertNotIn(str(port), response.get_data(as_text=True))
+
+    def test_transport_exceptions_map_to_502_or_504(self):
+        url = f"{SCHEMA_URL}?token={BODY_MARKER}"
+        cases = [
+            (requests.exceptions.ConnectionError(f"reset by peer {url}"), 502),
+            (requests.exceptions.ReadTimeout(f"read timed out {url}"), 504),
+            # ConnectTimeout is both a ConnectionError and a Timeout.
+            (requests.exceptions.ConnectTimeout(f"connect timed out {url}"), 504),
+        ]
+        for exc, status in cases:
+            with self.subTest(type(exc).__name__):
+                self.stub.add(SCHEMA_URL, ("raise", exc))
+
+                response = self.client.get("/")
+
+                self.assert_error_page(response, status, "Airtable")
+
     # -- schema payload shape ---------------------------------------------
 
-    def test_schema_200_with_malformed_json_is_a_clear_error(self):
-        self.stub.add(SCHEMA_URL, (200, b"<html>gateway says hi</html>"))
+    def test_schema_200_with_malformed_json_is_a_clear_502(self):
+        self.stub.add(SCHEMA_URL, (200, f"<html>gateway says {BODY_MARKER}</html>".encode()))
 
-        exc = self.get_expecting_error()
+        response = self.client.get("/")
 
-        self.assert_schema_error(exc, "not valid JSON")
+        self.assert_error_page(response, 502, "Airtable", "not valid JSON")
         self.assertEqual([call["url"] for call in self.stub.calls], [SCHEMA_URL])
 
-    def test_schema_200_without_tables_is_a_clear_error(self):
+    def test_schema_200_without_tables_is_a_clear_502(self):
         payloads = {
-            "no tables key": {"unexpected": True},
+            "no tables key": {"unexpected": BODY_MARKER},
             "tables is null": {"tables": None},
             "tables is an object": {"tables": {"name": "Companies"}},
             "payload is a list": [],
@@ -317,14 +401,24 @@ class RouteTest(unittest.TestCase):
                 self.stub.calls.clear()
                 self.stub.add(SCHEMA_URL, (200, payload))
 
-                exc = self.get_expecting_error()
+                response = self.client.get("/")
 
-                self.assert_schema_error(exc, '"tables"')
+                self.assert_error_page(response, 502, "Airtable", '"tables"')
                 self.assertEqual([call["url"] for call in self.stub.calls], [SCHEMA_URL])
+
+    # -- the handler is narrow --------------------------------------------
+
+    def test_unrelated_errors_are_not_turned_into_an_upstream_error_page(self):
+        # A table entry without a name is a bug-shaped failure, not an
+        # upstream outage; it must not be reported as 502/504.
+        self.stub.add(SCHEMA_URL, (200, {"tables": [{"fields": []}]}))
+
+        with self.assertRaises(KeyError):
+            self.client.get("/")
 
     # -- stalled records fetch --------------------------------------------
 
-    def test_stalled_records_fetch_times_out_instead_of_hanging(self):
+    def test_stalled_records_fetch_becomes_504_instead_of_hanging(self):
         # A loopback listener that completes the TCP handshake (kernel
         # backlog) and never sends a byte back.
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -364,7 +458,8 @@ class RouteTest(unittest.TestCase):
             f"(timeout passed to the transport: {stalled[0]['timeout']!r})",
         )
         self.assertEqual(stalled[0]["timeout"], SHORT_TIMEOUT)
-        self.assertIsInstance(outcome.get("error"), requests.exceptions.Timeout, f"got {outcome!r}")
+        self.assertNotIn("error", outcome)
+        self.assert_error_page(outcome["response"], 504, "Airtable", "timed out")
         self.assertLess(elapsed, HANG_LIMIT)
 
 
