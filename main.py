@@ -1,5 +1,5 @@
 import requests
-from flask import Flask, render_template
+from flask import Flask, Response, render_template
 from pyairtable import Table
 from pyvis.network import Network
 import os
@@ -14,6 +14,32 @@ AIRTABLE_TIMEOUT = 30 # seconds, applied to every Airtable request
 
 class AirtableSchemaError(RuntimeError):
     """The schema response was not the expected {"tables": [...]} payload."""
+
+# Turn Airtable failures into a short page instead of a bare 500. The text is
+# built from fixed strings and the upstream status code only: exception
+# messages can carry the request URL and the upstream response body.
+@app.errorhandler(requests.exceptions.HTTPError)
+@app.errorhandler(requests.exceptions.Timeout)
+@app.errorhandler(requests.exceptions.ConnectionError)
+@app.errorhandler(AirtableSchemaError)
+def airtable_error(exc):
+    status = 502
+    if isinstance(exc, requests.exceptions.Timeout):
+        # Checked first: ConnectTimeout is also a ConnectionError.
+        status = 504
+        message = 'The request to Airtable timed out.'
+    elif isinstance(exc, AirtableSchemaError):
+        message = str(exc) + '.'
+    elif isinstance(exc, requests.exceptions.HTTPError):
+        upstream_status = getattr(exc.response, 'status_code', None)
+        if upstream_status is None:
+            message = 'Airtable returned an error.'
+        else:
+            message = f'Airtable returned HTTP {upstream_status}.'
+    else:
+        message = 'Could not connect to Airtable.'
+    print(f"airtable error ({type(exc).__name__}): {message}")
+    return Response(message + '\n', status=status, mimetype='text/plain')
 
 # Retrieve data from Airtable
 def get_airtable_data(table_name):
@@ -131,6 +157,7 @@ def index():
     )
 
     # Save graph as HTML file
+    os.makedirs('static', exist_ok=True)
     net.save_graph('static/graph.html')
 
     return render_template('index.html')
