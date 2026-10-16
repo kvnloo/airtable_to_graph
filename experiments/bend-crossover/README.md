@@ -33,3 +33,13 @@ There is intentionally **no runtime GPU backend in this branch**. This avoids cl
 5. Keep candidate upstream work off the origin until the factory HITL gate and the repository's contribution policy permit it.
 
 Related but separate: `yoheinakajima/prezograph` is a browser-first offline deck engine—no implicit CUDA speedup from compiling its JS. `yoheinakajima/activegraph` has a recorded investment-diligence pack and **issues-first** external code contributions, so candidate backend integrations begin with a measured standalone adapter, not a drive-by runtime PR. `kvnloo/z0intelligence` can ingest shadow perf receipts without changing routing authority.
+
+## Native Bend CPU/CUDA smoke on the user's CUDA machine
+
+The optional probe requires **exact Bend 2.0.36** (matching Hapsland's pin), checks for an NVIDIA device, and compiles Bend's documented parallel `pow2!` example in a temporary directory. It requests a CPU run (`--gpu off`) and a default-mode run and compares their exact `1048576` output. **Device presence is not a guarantee the runtime executed on GPU.** This is a toolchain/output smoke, not a graph kernel or performance evidence.
+
+```sh
+python experiments/bend-crossover/gpu_probe.py
+```
+
+Exit 0: compiler produced a binary and both runs agreed; exit 2: missing compiler/device; other nonzero: failed build or output parity. The probe uses no Airtable credentials or personal data. Only a later profiled numeric graph workload with device-verified execution can establish CUDA acceleration. Credit the original Bend authors, https://github.com/bendlang/bend.
