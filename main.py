@@ -4,6 +4,7 @@ from pyairtable import Table
 from pyvis.network import Network
 import os
 from concurrent.futures import ThreadPoolExecutor
+from graph_core import find_relational_columns, iter_relational_edges
 
 app = Flask(__name__)
 
@@ -16,17 +17,6 @@ def get_airtable_data(table_name):
     table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, table_name)
     return table.all()
 
-# Identify relational columns
-def find_relational_columns(tables):
-    print("finding relational columns")
-    relational_columns = {}
-    for table_name, records in tables.items():
-        for record in records:
-            for field, value in record['fields'].items():
-                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], str) and value[0].startswith('rec'):
-                    relational_columns.setdefault(table_name, set()).add(field)
-                    break  # Break the loop if a relational column is found for the table
-    return relational_columns
 
 # Build knowledge graph
 def build_knowledge_graph(tables, relational_columns):
@@ -43,12 +33,8 @@ def build_knowledge_graph(tables, relational_columns):
     for node_id, (node_label, table_name) in nodes.items():
         net.add_node(node_id, label=node_label, title=node_label, group=table_name, shape='box')
 
-    for table_name, columns in relational_columns.items():
-        for column in columns:
-            for record in tables[table_name]:
-                if column in record['fields']:
-                    for related_id in record['fields'][column]:
-                        net.add_edge(record['id'], related_id, title=column)
+    for source_id, target_id, column in iter_relational_edges(tables, relational_columns):
+        net.add_edge(source_id, target_id, title=column)
 
     return net
 
